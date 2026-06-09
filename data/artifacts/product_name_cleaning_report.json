@@ -1,0 +1,576 @@
+{
+  "raw_train": {
+    "rows": 4892,
+    "ocr_text_empty": 987,
+    "product_name_empty": 1993,
+    "product_name_nonempty": 2899,
+    "product_name_unique_exact": 495,
+    "product_name_unique_semantic": 367,
+    "product_name_singletons": 168,
+    "product_name_long_gt_50": 21,
+    "product_name_semicolon": 30,
+    "product_name_comma": 35,
+    "top_product_names": [
+      [
+        "ĐỒ HỘP HẠ LONG",
+        302
+      ],
+      [
+        "Đồ hộp Hạ Long",
+        275
+      ],
+      [
+        "đồ hộp Hạ Long",
+        89
+      ],
+      [
+        "patê CỘT ĐÈN HẢI PHÒNG",
+        63
+      ],
+      [
+        "Pate Cột Đèn Hải Phòng",
+        54
+      ],
+      [
+        "NAN",
+        52
+      ],
+      [
+        "sữa NAN",
+        52
+      ],
+      [
+        "pate cột đèn",
+        45
+      ],
+      [
+        "Nestlé NAN",
+        43
+      ],
+      [
+        "Sữa Nestle",
+        41
+      ],
+      [
+        "Nestlé",
+        35
+      ],
+      [
+        "Highlands Coffee",
+        30
+      ],
+      [
+        "HIGHLANDS COFFEE",
+        30
+      ],
+      [
+        "sữa Nestle",
+        29
+      ],
+      [
+        "HALONG CANFOCO Patê Cột Đèn Hải Phòng",
+        28
+      ],
+      [
+        "Nestlé NAN OPTIPRO PLUS",
+        28
+      ],
+      [
+        "Nestlé NAN INFINIPRO A2",
+        28
+      ],
+      [
+        "Nestlé NAN OPTIpro PLUS",
+        28
+      ],
+      [
+        "PATE CỘT ĐÈN HẢI PHÒNG",
+        26
+      ],
+      [
+        "sữa Nestlé",
+        26
+      ],
+      [
+        "Pate cột đèn Hải Phòng",
+        25
+      ],
+      [
+        "NESTLÉ",
+        25
+      ],
+      [
+        "PATE CỘT ĐÈN",
+        24
+      ],
+      [
+        "Halong Canfoco Patê Cột Đèn Hải Phòng",
+        23
+      ],
+      [
+        "sữa Nan",
+        23
+      ]
+    ]
+  },
+  "clean_train": {
+    "rows": 4892,
+    "ocr_text_empty": 987,
+    "product_name_empty": 1993,
+    "product_name_nonempty": 2899,
+    "product_name_unique_exact": 265,
+    "product_name_unique_semantic": 254,
+    "product_name_singletons": 116,
+    "product_name_long_gt_50": 0,
+    "product_name_semicolon": 3,
+    "product_name_comma": 6,
+    "top_product_names": [
+      [
+        "Đồ Hộp Hạ Long",
+        774
+      ],
+      [
+        "Pate Cột Đèn Hải Phòng",
+        492
+      ],
+      [
+        "Nestlé NAN",
+        335
+      ],
+      [
+        "Nestlé NAN OPTIPRO PLUS",
+        173
+      ],
+      [
+        "Highlands Coffee",
+        109
+      ],
+      [
+        "Nestlé NAN INFINIPRO A2",
+        95
+      ],
+      [
+        "Sữa Nestle",
+        70
+      ],
+      [
+        "Ha Long Canfoco",
+        63
+      ],
+      [
+        "Nestlé",
+        60
+      ],
+      [
+        "Aptamil",
+        40
+      ],
+      [
+        "sữa Nestlé",
+        26
+      ],
+      [
+        "HALONG CAFOCO",
+        19
+      ],
+      [
+        "Nestle",
+        19
+      ],
+      [
+        "Coffee House",
+        14
+      ],
+      [
+        "Nestlé sữa bột trẻ em",
+        12
+      ],
+      [
+        "Vissan",
+        10
+      ],
+      [
+        "Pate Hạ Long",
+        10
+      ],
+      [
+        "PATE",
+        10
+      ],
+      [
+        "Nestle BEBA",
+        10
+      ],
+      [
+        "Nestlé Việt Nam",
+        9
+      ],
+      [
+        "SỮA NESTLÉ",
+        9
+      ],
+      [
+        "HOA SEN HOME",
+        8
+      ],
+      [
+        "thịt lợn",
+        8
+      ],
+      [
+        "Thịt hộp",
+        8
+      ],
+      [
+        "Hipp",
+        8
+      ]
+    ]
+  },
+  "model_ready_train": {
+    "rows": 4826,
+    "ocr_text_empty": 975,
+    "product_name_empty": 1965,
+    "product_name_nonempty": 2861,
+    "product_name_unique_exact": 265,
+    "product_name_unique_semantic": 254,
+    "product_name_singletons": 116,
+    "product_name_long_gt_50": 0,
+    "product_name_semicolon": 3,
+    "product_name_comma": 6,
+    "top_product_names": [
+      [
+        "Đồ Hộp Hạ Long",
+        774
+      ],
+      [
+        "Pate Cột Đèn Hải Phòng",
+        492
+      ],
+      [
+        "Nestlé NAN",
+        326
+      ],
+      [
+        "Nestlé NAN OPTIPRO PLUS",
+        164
+      ],
+      [
+        "Highlands Coffee",
+        109
+      ],
+      [
+        "Nestlé NAN INFINIPRO A2",
+        88
+      ],
+      [
+        "Sữa Nestle",
+        70
+      ],
+      [
+        "Ha Long Canfoco",
+        63
+      ],
+      [
+        "Nestlé",
+        58
+      ],
+      [
+        "Aptamil",
+        38
+      ],
+      [
+        "sữa Nestlé",
+        26
+      ],
+      [
+        "HALONG CAFOCO",
+        19
+      ],
+      [
+        "Nestle",
+        19
+      ],
+      [
+        "Coffee House",
+        14
+      ],
+      [
+        "Vissan",
+        10
+      ],
+      [
+        "Pate Hạ Long",
+        10
+      ],
+      [
+        "PATE",
+        10
+      ],
+      [
+        "Nestle BEBA",
+        10
+      ],
+      [
+        "Nestlé sữa bột trẻ em",
+        10
+      ],
+      [
+        "SỮA NESTLÉ",
+        9
+      ],
+      [
+        "HOA SEN HOME",
+        8
+      ],
+      [
+        "thịt lợn",
+        8
+      ],
+      [
+        "Thịt hộp",
+        8
+      ],
+      [
+        "Hipp",
+        8
+      ],
+      [
+        "Vinamilk",
+        8
+      ]
+    ],
+    "excluded_label_conflict_rows": 66
+  },
+  "raw_submission_v002": {
+    "rows": 2006,
+    "ocr_text_empty": 323,
+    "product_name_empty": 1106,
+    "product_name_nonempty": 900,
+    "product_name_unique_exact": 84,
+    "product_name_unique_semantic": 72,
+    "product_name_singletons": 24,
+    "product_name_long_gt_50": 3,
+    "product_name_semicolon": 7,
+    "product_name_comma": 30,
+    "top_product_names": [
+      [
+        "Đồ Hộp Hạ Long",
+        231
+      ],
+      [
+        "Pate Cột Đèn Hải Phòng",
+        143
+      ],
+      [
+        "Ha Long Canfoco",
+        52
+      ],
+      [
+        "Highlands Coffee",
+        52
+      ],
+      [
+        "Nestlé NAN",
+        30
+      ],
+      [
+        "Aptamil",
+        30
+      ],
+      [
+        "ĐỒ HỘP CÔNG TY CP ĐỒ HỘP HẠ LONG",
+        23
+      ],
+      [
+        "Hạ Long Canfoco Pate",
+        23
+      ],
+      [
+        "HIGHLANDS COFFEE",
+        20
+      ],
+      [
+        "Highlands Coffee trà sen vàng, trà vải",
+        17
+      ],
+      [
+        "BÁNH MÌ HIGHLANDS",
+        12
+      ],
+      [
+        "NESTLE, ĐỒ HỘP HẠ LONG",
+        11
+      ],
+      [
+        "Halong Canfoco",
+        11
+      ],
+      [
+        "NESTLÉ BEBA 2",
+        11
+      ],
+      [
+        "ĐỒ HỘP HẠ LONG HALONG CANFOCO",
+        10
+      ],
+      [
+        "CON BÒ SỮA",
+        10
+      ],
+      [
+        "Nestlé NAN OPTIPRO PLUS",
+        10
+      ],
+      [
+        "NESTLÉ NAN OPTI pro plus",
+        10
+      ],
+      [
+        "sản phẩm đồ hộp",
+        9
+      ],
+      [
+        "HOA SEN HOME",
+        7
+      ],
+      [
+        "CÔNG TY CỔ PHẦN ĐỒ HỘP HẠ LONG",
+        7
+      ],
+      [
+        "PATE CộT đIệN",
+        7
+      ],
+      [
+        "Hạ Long Canfoco Đồ hộp",
+        6
+      ],
+      [
+        "BÁNH MÌ PATE CỘT ĐÈN",
+        6
+      ],
+      [
+        "HALONG CANFOCO Patê Cột Đèn Hải Phòng",
+        6
+      ]
+    ]
+  },
+  "clean_submission_v002": {
+    "rows": 2006,
+    "ocr_text_empty": 323,
+    "product_name_empty": 1106,
+    "product_name_nonempty": 900,
+    "product_name_unique_exact": 42,
+    "product_name_unique_semantic": 42,
+    "product_name_singletons": 11,
+    "product_name_long_gt_50": 0,
+    "product_name_semicolon": 0,
+    "product_name_comma": 0,
+    "top_product_names": [
+      [
+        "Đồ Hộp Hạ Long",
+        292
+      ],
+      [
+        "Pate Cột Đèn Hải Phòng",
+        186
+      ],
+      [
+        "Highlands Coffee",
+        102
+      ],
+      [
+        "Ha Long Canfoco",
+        98
+      ],
+      [
+        "Aptamil",
+        37
+      ],
+      [
+        "Nestlé NAN",
+        34
+      ],
+      [
+        "Nestlé NAN OPTIPRO PLUS",
+        26
+      ],
+      [
+        "BÁNH MÌ HIGHLANDS",
+        12
+      ],
+      [
+        "NESTLÉ BEBA 2",
+        11
+      ],
+      [
+        "CON BÒ SỮA",
+        10
+      ],
+      [
+        "sản phẩm đồ hộp",
+        9
+      ],
+      [
+        "HOA SEN HOME",
+        7
+      ],
+      [
+        "Pate Cột Điện",
+        7
+      ],
+      [
+        "thịt lợn",
+        5
+      ],
+      [
+        "Thịt hộp",
+        5
+      ],
+      [
+        "CP",
+        5
+      ],
+      [
+        "Pate Hạ Long",
+        4
+      ],
+      [
+        "TRÀ PHÚC KIẾN SEN VẢI & AMERICANO VẢI",
+        4
+      ],
+      [
+        "Nestlé NAN INFINIPRO A2",
+        4
+      ],
+      [
+        "PATE Thịt xông khói",
+        3
+      ],
+      [
+        "Vissan",
+        3
+      ],
+      [
+        "QUANG HONG SARDINE",
+        3
+      ],
+      [
+        "NESTLÉ Alfamino INFANT",
+        3
+      ],
+      [
+        "Vinamilk",
+        3
+      ],
+      [
+        "SỮA CÔNG THỨC NESTLÉ",
+        3
+      ]
+    ],
+    "unknown_product_rows_vs_clean_train": 0,
+    "unknown_product_unique_vs_clean_train": 0,
+    "unknown_product_examples": []
+  }
+}

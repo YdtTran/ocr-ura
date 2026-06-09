@@ -1,0 +1,6 @@
+easyocr
+numpy
+pandas
+Pillow
+scikit-learn
+tqdm

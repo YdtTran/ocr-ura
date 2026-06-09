@@ -1,0 +1,1293 @@
+# %% [markdown]
+# # V003 Brand Inference (OCR + Product Priority)
+# 
+# 
+# ## Lightweight constraints (Final Presentation)
+# 
+# | Requirement | This baseline |
+# |---|---|
+# | CPU-only (no GPU) | `gpu=False` everywhere |
+# | Small model / memory | Product head ≈ **few MB** (sklearn TF-IDF + LogisticRegression) |
+# | Fast product inference | **<1 ms** per image after OCR |
+# | Deployable pattern | Rules + tiny classifier on OCR text |
+# 
+# > EasyOCR (~200 MB weights) is used here as a **convenient OCR demo**. For production, swap in a lighter OCR (PaddleOCR mobile, Tesseract, custom tiny CNN) and keep the same product head.
+# 
+# ## Scoring Formula
+# 
+# $$\text{Score} = 0.6 \times F1_{\text{product}} + 0.4 \times (1 - \text{CER})$$
+# 
+# ## Pipeline (what to copy)
+# 
+# 1. **OCR** — pluggable backend (EasyOCR in this notebook)  
+# 2. **Product** — train-label-derived priority rules + tiny trainable head  
+# 3. **Evaluate** — composite metric (Cell 7)
+# 
+# ## Required Files (Kaggle Input)
+# 
+# | File | Description |
+# |---|---|
+# | `test.csv` | Image IDs |
+# | `test_images/images/` | Test JPEGs (`img_XXXX.jpg`) — Kaggle competition mount |
+# | `sample_submission.csv` | Format template |
+# | `train_labels.csv` | Draft labels for the lightweight product head |
+# 
+# > **Kaggle path:** `/kaggle/input/competitions/the-2nd-ura-hackathon/`  
+# > Add Input → **Competition Data** (not a manual Dataset upload).  
+# > Local dev may use `test/test_images.zip` instead of `test_images/`.
+# 
+# ## Notebook Outline
+# 
+# 1. Install dependencies  
+# 2. Load data  
+# 3. Brand rules (zero-cost baseline)  
+# 4. Train lightweight product model (~seconds, few MB)  
+# 5. OCR engine  
+# 6. Main loop → `submission.csv`  
+# 7. Validate export  
+# 8. Local composite score
+# 
+
+# %% [markdown]
+# ## Cell 1 — Install Dependencies
+# 
+# Run once. Most packages are preinstalled on Kaggle; this cell ensures EasyOCR is available.
+
+# %% [code]
+!pip install easyocr tqdm scikit-learn -q
+print("Install done")
+
+
+# %% [markdown]
+# ## Cell 2 — Load Data
+# 
+# Read `test.csv`, auto-detect the competition input path, and use `test_images/` (or extract a zip locally).
+# 
+# If `train_labels.csv` is attached to the same Kaggle dataset, it is loaded for optional supervised learning (draft v1 weak labels).
+# 
+# No Internet required — images are read from the competition dataset (see Dataset Description).
+
+# %% [code]
+import re, time, zipfile
+import pandas as pd
+from pathlib import Path
+
+try:
+    from tqdm.notebook import tqdm
+except ImportError:
+    from tqdm import tqdm
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+
+# Kaggle competition mount: test_images/images/img_XXXX.jpg
+IMAGE_DIR_CANDIDATES = (
+    "test_images/images",
+    "test_images",
+    "images",
+    "test/images",
+    "test/test_images/images",
+    "test/test_images",
+)
+IMAGE_ZIP_NAMES = (
+    "test_images.zip",
+    "images.zip",
+    "test/test_images.zip",
+    "test/images.zip",
+)
+
+
+def _input_roots() -> list[Path]:
+    """Candidate dataset roots: Kaggle competition mount, datasets, local copies."""
+    roots: list[Path] = []
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        comp_root = kaggle_input / "competitions"
+        if comp_root.exists():
+            roots.extend(sorted(comp_root.iterdir()))
+        roots.extend(sorted(kaggle_input.iterdir()))
+    for local in [Path("public_dataset"), Path("smce_dataset/test"), Path(".")]:
+        if local.exists():
+            roots.append(local.resolve())
+    # de-dupe while preserving order
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for r in roots:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def resolve_input_dir() -> Path:
+    """Auto-detect dataset root containing test.csv (Kaggle competition or uploaded Data)."""
+    for root in _input_roots():
+        if (root / "test.csv").exists():
+            return root
+    # nested test.csv (rare uploads)
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        for test_csv in sorted(kaggle_input.rglob("test.csv")):
+            return test_csv.parent
+    hint = (
+        "Dataset not found. On Kaggle: Add Input → Competition Data → "
+        "The 2nd URA Hackathon (expect test.csv + test_images/ under "
+        "/kaggle/input/competitions/the-2nd-ura-hackathon/)."
+    )
+    if kaggle_input.exists():
+        listing = sorted(str(p) for p in kaggle_input.rglob("*") if p.is_file())[:20]
+        hint += f"\n/kaggle/input files (first 20): {listing}"
+    raise FileNotFoundError(hint)
+
+
+def _find_images_dir(input_dir: Path) -> Path | None:
+    for rel in IMAGE_DIR_CANDIDATES:
+        images_dir = input_dir / rel
+        if images_dir.is_dir() and any(images_dir.glob("*.jpg")):
+            return images_dir
+    return None
+
+
+def _find_images_zip(input_dir: Path) -> Path | None:
+    for rel in IMAGE_ZIP_NAMES:
+        zip_path = input_dir / rel
+        if zip_path.is_file():
+            return zip_path
+    for zip_path in sorted(input_dir.rglob("*.zip")):
+        name = zip_path.name.lower()
+        if "train" in name and "test" not in name:
+            continue
+        if name in ("test_images.zip", "images.zip") or name.endswith("images.zip"):
+            return zip_path
+    return None
+
+
+def setup_images_dir(input_dir: Path, work_dir: Path) -> Path:
+    """Use test_images/ or images/ from input; otherwise extract a zip once to working/."""
+    images_dir = _find_images_dir(input_dir)
+    if images_dir is not None:
+        return images_dir
+
+    zip_path = _find_images_zip(input_dir)
+    if zip_path is None:
+        raise FileNotFoundError(
+            f"No test images under {input_dir}. Expected test_images/, images/, "
+            f"or one of {IMAGE_ZIP_NAMES}."
+        )
+
+    extract_root = work_dir / "dataset_images"
+    images_dir = extract_root / "images"
+    if not any(images_dir.glob("*.jpg")):
+        extract_root.mkdir(parents=True, exist_ok=True)
+        print(f"Extracting {zip_path} ...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_root)
+        # zip may unpack as images/, test_images/, or test_images/images/
+        if not any(images_dir.glob("*.jpg")):
+            for rel in ("test_images/images", "test_images", "images"):
+                alt = extract_root / rel
+                if alt.is_dir() and any(alt.glob("*.jpg")):
+                    images_dir = alt
+                    break
+    return images_dir
+
+
+INPUT_DIR = resolve_input_dir()
+WORK_DIR = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
+IMAGES_DIR = setup_images_dir(INPUT_DIR, WORK_DIR)
+
+TEST_CSV = INPUT_DIR / "test.csv"
+SAMPLE_CSV = INPUT_DIR / "sample_submission.csv"
+OUTPUT_CSV = WORK_DIR / "submission.csv"
+CHECKPOINT_CSV = WORK_DIR / "checkpoint.csv"
+
+test_df = pd.read_csv(TEST_CSV)
+image_ids_on_disk = {p.stem for p in IMAGES_DIR.glob("*.jpg")}
+
+train_labels_df = None
+for labels_path in [INPUT_DIR / "train_labels.csv", Path("public_dataset/train_labels.csv")]:
+    if labels_path.exists():
+        train_labels_df = pd.read_csv(labels_path, keep_default_na=False)
+        break
+
+print(f"Input dir   : {INPUT_DIR}")
+print(f"Test set    : {len(test_df):,} images")
+print(f"Images dir  : {IMAGES_DIR} ({len(image_ids_on_disk):,} jpg)")
+print(f"Working dir : {WORK_DIR}")
+
+if train_labels_df is not None:
+    ocr_fill = (train_labels_df["ocr_text"].astype(str).str.strip() != "").mean()
+    prod_fill = (train_labels_df["product_name"].astype(str).str.strip() != "").mean()
+    print(f"Train labels: {len(train_labels_df):,} rows (draft v1 | OCR {ocr_fill:.1%} | product {prod_fill:.1%})")
+    print("  Use train.csv + train_images.zip with train_labels_df for supervised training.")
+else:
+    print("Train labels: not found (test-only mode)")
+
+missing = set(test_df["image_id"]) - image_ids_on_disk
+if missing:
+    print(f"Warning: {len(missing)} image_ids have no jpg (OCR will return empty for those)")
+else:
+    print("All test image_ids have matching jpg files")
+
+print("\nPreview test.csv:")
+test_df.head(3)
+
+
+# %% [markdown]
+# ## Cell 3 — Brand Rules (Train-Priority Product Inference)
+# 
+# Regex dictionary — **no training, no model file**, runs in microseconds.
+# 
+# V003 uses `train_labels.csv` distribution as the priority map:
+# 
+# | Signal family | Train support | Inference stance |
+# |---|---:|---|
+# | Đồ Hộp Hạ Long | ~806 labels | high recall, top priority in news/product context |
+# | Nestlé / NAN | ~678 / ~603 labels | high recall, specialize NAN OPTIPRO/INFINIPRO first |
+# | Pate Cột Đèn | ~492 labels | high precision when `pate + cot + den` appears |
+# | Ha Long Canfoco | ~169 labels | strong, but lower than explicit Đồ Hộp Hạ Long/Pate |
+# | Highlands Coffee | ~109 labels | guarded in multi-brand news context |
+# | Aptamil | ~40 labels | direct brand match |
+# 
+# `ocr_text` is left as OCR output; brand inference is applied only to `product_name`.
+# 
+
+# %% [code]
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+import unicodedata
+from collections import Counter, defaultdict
+from pathlib import PurePosixPath
+from typing import Iterable, Mapping, Sequence
+from urllib.parse import urlparse
+
+
+def clean_text(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def ascii_fold(value) -> str:
+    text = unicodedata.normalize("NFC", clean_text(value))
+    text = text.replace("Đ", "D").replace("đ", "d")
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+
+
+def postprocess_ocr(text: str) -> str:
+    """Normalize whitespace without deleting repeated words."""
+    return clean_text(text)
+
+
+def _bbox_stats(bbox: Sequence[Sequence[float]]) -> dict:
+    xs = [float(point[0]) for point in bbox]
+    ys = [float(point[1]) for point in bbox]
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    return {
+        "left": left,
+        "right": right,
+        "top": top,
+        "bottom": bottom,
+        "center_x": (left + right) / 2,
+        "center_y": (top + bottom) / 2,
+        "width": max(right - left, 1.0),
+        "height": max(bottom - top, 1.0),
+    }
+
+
+def normalize_detection(detection) -> dict:
+    if isinstance(detection, Mapping):
+        bbox = detection["bbox"]
+        text = detection.get("text", "")
+        confidence = detection.get("confidence", 0.0)
+    else:
+        bbox, text, confidence = detection[:3]
+    item = {
+        "bbox": [[float(x), float(y)] for x, y in bbox],
+        "text": clean_text(text),
+        "confidence": float(confidence),
+    }
+    item.update(_bbox_stats(item["bbox"]))
+    return item
+
+
+def order_detections(detections: Iterable, line_tolerance: float = 0.6) -> list[dict]:
+    """Group boxes into visual lines, then order lines and boxes."""
+    items = [normalize_detection(item) for item in detections]
+    items = [item for item in items if item["text"]]
+    items.sort(key=lambda item: (item["center_y"], item["left"]))
+
+    lines: list[dict] = []
+    for item in items:
+        best = None
+        best_distance = math.inf
+        for line in lines:
+            tolerance = line_tolerance * max(line["mean_height"], item["height"])
+            distance = abs(item["center_y"] - line["center_y"])
+            if distance <= tolerance and distance < best_distance:
+                best = line
+                best_distance = distance
+        if best is None:
+            lines.append(
+                {
+                    "items": [item],
+                    "center_y": item["center_y"],
+                    "mean_height": item["height"],
+                }
+            )
+        else:
+            best["items"].append(item)
+            count = len(best["items"])
+            best["center_y"] = sum(x["center_y"] for x in best["items"]) / count
+            best["mean_height"] = sum(x["height"] for x in best["items"]) / count
+
+    lines.sort(key=lambda line: min(item["top"] for item in line["items"]))
+    ordered = []
+    for line_index, line in enumerate(lines):
+        line["items"].sort(key=lambda item: item["left"])
+        for item in line["items"]:
+            item["line_index"] = line_index
+            ordered.append(item)
+    return ordered
+
+
+def select_detections(
+    detections: Iterable,
+    confidence_threshold: float = 0.25,
+    line_tolerance: float = 0.6,
+) -> list[dict]:
+    selected = [
+        normalize_detection(item)
+        for item in detections
+        if float(item.get("confidence", 0.0) if isinstance(item, Mapping) else item[2])
+        >= confidence_threshold
+    ]
+    return order_detections(selected, line_tolerance=line_tolerance)
+
+
+def detections_to_text(detections: Iterable[Mapping]) -> str:
+    return postprocess_ocr(" ".join(clean_text(item.get("text", "")) for item in detections))
+
+
+def detection_summary(detections: Sequence[Mapping]) -> dict:
+    confidences = [float(item.get("confidence", 0.0)) for item in detections]
+    return {
+        "detection_count": len(detections),
+        "mean_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
+    }
+
+
+def should_retry_ocr(
+    text: str,
+    detection_count: int,
+    mean_confidence: float,
+    min_chars: int = 6,
+    min_mean_confidence: float = 0.40,
+) -> bool:
+    text = clean_text(text)
+    return (
+        not text
+        or len(text) < min_chars
+        or detection_count == 0
+        or mean_confidence < min_mean_confidence
+    )
+
+
+def ocr_quality(text: str, detection_count: int, mean_confidence: float) -> float:
+    text = clean_text(text)
+    alpha_numeric = sum(char.isalnum() for char in text)
+    length_score = min(alpha_numeric / 80.0, 1.0)
+    box_score = min(detection_count / 8.0, 1.0)
+    return 0.55 * mean_confidence + 0.30 * length_score + 0.15 * box_score
+
+
+def choose_ocr_pass(primary: Mapping, retry: Mapping | None) -> Mapping:
+    if retry is None:
+        return primary
+    primary_score = ocr_quality(
+        primary.get("text", ""),
+        int(primary.get("detection_count", 0)),
+        float(primary.get("mean_confidence", 0.0)),
+    )
+    retry_score = ocr_quality(
+        retry.get("text", ""),
+        int(retry.get("detection_count", 0)),
+        float(retry.get("mean_confidence", 0.0)),
+    )
+    return retry if retry_score > primary_score else primary
+
+
+def resize_dimensions(
+    width: int,
+    height: int,
+    min_long_side: int = 720,
+    max_long_side: int = 1600,
+) -> tuple[int, int]:
+    long_side = max(width, height)
+    if long_side < min_long_side:
+        ratio = min_long_side / long_side
+    elif long_side > max_long_side:
+        ratio = max_long_side / long_side
+    else:
+        ratio = 1.0
+    return max(1, round(width * ratio)), max(1, round(height * ratio))
+
+
+def product_semantic_key(value) -> str:
+    text = unicodedata.normalize("NFC", clean_text(value))
+    if not text:
+        return ""
+    folded = ascii_fold(text).lower()
+    folded = re.sub(r"[^a-z0-9]+", " ", folded).strip()
+    folded = re.sub(r"\bpat[e]?\b", "pate", folded)
+    folded = re.sub(r"\bopti\s*pro\s*plus\b|\boptiproplus\b", "optipro plus", folded)
+    folded = re.sub(r"\bopti\s*pro\b", "optipro", folded)
+    folded = re.sub(
+        r"\bi?nfini\s*pro\b|\bi?nfinipro\b|\bifinipro\b",
+        "infinipro",
+        folded,
+    )
+    folded = folded.replace("highland coffee", "highlands coffee")
+    folded = folded.replace("halong canfoco", "ha long canfoco")
+    return folded
+
+
+def build_product_alias_map(
+    values: Iterable,
+    min_token_f1: float = 0.8,
+) -> dict[str, str]:
+    groups: dict[str, Counter] = defaultdict(Counter)
+    for value in values:
+        text = clean_text(value)
+        if text:
+            groups[product_semantic_key(text)][text] += 1
+
+    aliases = {}
+    for key, counts in groups.items():
+        variants = list(counts)
+        representative = max(
+            variants,
+            key=lambda candidate: (
+                sum(token_f1(candidate, variant) * counts[variant] for variant in variants),
+                counts[candidate],
+                -len(candidate),
+                candidate,
+            ),
+        )
+        for variant in variants:
+            aliases[variant] = (
+                representative
+                if token_f1(variant, representative) >= min_token_f1
+                else variant
+            )
+    return aliases
+
+
+def canonicalize_product(value, alias_map: Mapping[str, str] | None = None) -> str:
+    text = clean_text(value)
+    if not text or not alias_map:
+        return text
+    return alias_map.get(text, text)
+
+
+_PRODUCT_RULES = [
+    # Specific product-family rules first. These are high precision and worth strong recall.
+    (r"\bnan\b.*\bi?nfini\s*pro\b|\bnan\b.*\bi?nfinipro\b|\bnan\b.*\bifinipro\b", "Nestlé NAN INFINIPRO A2", 116, "specific"),
+    (r"\bnan\b.*\bopti\s*pro\b.*\bplus\b|\bnan\b.*\boptipro\s*plus\b|\bnan\b.*\boptiproplus\b", "Nestlé NAN OPTIPRO PLUS", 115, "specific"),
+    (r"\bpate\b.*\bcot\b.*\bden\b|\bcot\b.*\bden\b.*\bpate\b|pat[e3]\s*c[o0]t\s*d[e3]n", "Pate Cột Đèn Hải Phòng", 113, "specific"),
+    (r"\bvissan\b.*\bpate\s*heo\b", "Vissan Pate Heo", 105, "specific"),
+    (r"\bvinamilk\b.*\bflex\b", "Vinamilk Flex", 102, "specific"),
+    (r"\bdutch\s*lady\b.*\bgrow\b", "Dutch Lady Grow", 102, "specific"),
+
+    # High-support train families. These are intentionally stronger than generic brands.
+    (r"\bdo\s*hop\s*ha\s*long\b|\bd[o0]\s*h[o0]p\s*h[a4]\s*l[o0]ng\b", "Đồ Hộp Hạ Long", 96, "priority"),
+    (r"\bha\s*long\s*canfoco\b|\bhalong\s*canfoco\b|\bcanfoco\b", "Ha Long Canfoco", 88, "priority"),
+    (r"\bhighlands?\s*coffee\b|\bhighlands?\b", "Highlands Coffee", 84, "priority"),
+    (r"\baptamil\b", "Aptamil", 82, "priority"),
+    (r"\bnan\b", "Nestlé NAN", 80, "priority"),
+
+    # Secondary milk/food brands. Useful recall, but not enough to beat specific train families.
+    (r"\bpediasure\b", "Abbott PediaSure", 78, "brand"),
+    (r"\bsimilac\b", "Abbott Similac", 78, "brand"),
+    (r"\bglucerna\b", "Abbott Glucerna", 78, "brand"),
+    (r"\bmilo\b", "Nestlé Milo", 76, "brand"),
+    (r"\bvinamilk\b", "Vinamilk", 74, "brand"),
+    (r"\bth\s*true\b|\bthtrue\b", "TH True Milk", 74, "brand"),
+    (r"\bdutch\s*lady\b", "Dutch Lady", 74, "brand"),
+    (r"\bnutifood\b|\bnuti\b", "Nutifood", 72, "brand"),
+    (r"\bensure\b", "Abbott Ensure", 72, "brand"),
+    (r"\bfriso\b", "Friso", 72, "brand"),
+    (r"\bmeiji\b", "Meiji", 72, "brand"),
+    (r"\banlene\b", "Anlene", 72, "brand"),
+    (r"\byomost\b", "Yomost", 72, "brand"),
+    (r"\bfami\b", "Fami", 72, "brand"),
+    (r"\bvissan\b", "Vissan", 70, "brand"),
+    (r"\bcp\b", "CP", 66, "brand"),
+
+    # Generic fallbacks: useful for partial token F1, but heavily guarded.
+    (r"\bnestle\b", "Nestlé", 38, "generic"),
+    (r"\bpate\b", "Pate", 32, "generic"),
+]
+
+_NEWS_MARKERS = (
+    "news", "tin tuc", "thu hoi", "cong ty", "theo doi", "bao ",
+    "bat khan cap", "tong giam doc", "tam dung", "ngung ban", "virus",
+    "dich ta", "san pham boi", "tiktok",
+)
+
+_PRODUCT_CONTEXT_MARKERS = (
+    "san pham", "hop", "lon", "sua", "bot", "formula", "infant",
+    "pate", "thit", "tra", "coffee", "canfoco", "nan", "optipro",
+    "infinipro", "ha long", "cot den",
+)
+
+
+def product_candidates(text: str) -> list[dict]:
+    normalized = ascii_fold(text).lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    tokens = normalized.split()
+    news_context = len(tokens) >= 22 and any(marker in normalized for marker in _NEWS_MARKERS)
+    product_context = any(marker in normalized for marker in _PRODUCT_CONTEXT_MARKERS)
+    candidates = []
+    for pattern, product, specificity, tier in _PRODUCT_RULES:
+        matches = list(re.finditer(pattern, normalized, flags=re.IGNORECASE))
+        if not matches:
+            continue
+        first = matches[0].start()
+        support = len(matches)
+        context_penalty = 0
+        if news_context and tier in {"brand", "generic"}:
+            context_penalty += 22
+        if news_context and tier == "priority" and not product_context:
+            context_penalty += 10
+        if tier == "generic" and support == 1:
+            context_penalty += 12
+        if product == "Highlands Coffee" and news_context and re.search(r"\bdo\s*hop\s*ha\s*long\b|\bcanfoco\b|\bpate\b", normalized):
+            context_penalty += 18
+        score = (
+            specificity
+            + min(support - 1, 3) * 5
+            + (5 if product_context and tier in {"specific", "priority"} else 0)
+            - min(first / 120, 8)
+            - context_penalty
+        )
+        candidates.append(
+            {
+                "product_name": product,
+                "score": score,
+                "specificity": specificity,
+                "tier": tier,
+                "support": support,
+                "first_position": first,
+            }
+        )
+    return sorted(candidates, key=lambda item: (-item["score"], item["first_position"]))
+
+
+def predict_product_rule(text: str, min_score: float = 62) -> str:
+    candidates = product_candidates(text)
+    if not candidates or candidates[0]["score"] < min_score:
+        return ""
+    return candidates[0]["product_name"]
+
+
+def url_group_id(url: str) -> str:
+    parsed = urlparse(clean_text(url))
+    parts = PurePosixPath(parsed.path).parts
+    if len(parts) >= 2:
+        return parts[-2]
+    return clean_text(url)
+
+
+def audit_label_links(
+    labels: Iterable[Mapping],
+    links: Iterable[Mapping],
+) -> dict:
+    labels_by_id = {
+        clean_text(row.get("image_id")): (
+            clean_text(row.get("ocr_text")),
+            clean_text(row.get("product_name")),
+        )
+        for row in labels
+    }
+    url_by_id = {
+        clean_text(row.get("image_id")): clean_text(row.get("ImageURL"))
+        for row in links
+    }
+    ids_by_url: dict[str, list[str]] = defaultdict(list)
+    for image_id, url in url_by_id.items():
+        if image_id in labels_by_id and url:
+            ids_by_url[url].append(image_id)
+
+    conflicting_urls = {}
+    excluded_ids = set()
+    for url, image_ids in ids_by_url.items():
+        label_values = {labels_by_id[image_id] for image_id in image_ids}
+        if len(label_values) > 1:
+            conflicting_urls[url] = sorted(image_ids)
+            excluded_ids.update(image_ids)
+
+    all_ids = set(labels_by_id) & set(url_by_id)
+    return {
+        "conflicting_url_count": len(conflicting_urls),
+        "conflicting_urls": conflicting_urls,
+        "excluded_ids": excluded_ids,
+        "trusted_ids": all_ids - excluded_ids,
+        "url_by_id": url_by_id,
+        "group_by_id": {image_id: url_group_id(url) for image_id, url in url_by_id.items()},
+    }
+
+
+def grouped_dev_split(
+    records: Iterable[Mapping],
+    dev_fraction: float = 0.2,
+    seed: int = 2026,
+) -> tuple[set[str], set[str]]:
+    if not 0 < dev_fraction < 1:
+        raise ValueError("dev_fraction must be between 0 and 1")
+    groups: dict[str, list[str]] = defaultdict(list)
+    for row in records:
+        image_id = clean_text(row.get("image_id"))
+        group_id = clean_text(row.get("group_id")) or image_id
+        if image_id:
+            groups[group_id].append(image_id)
+
+    ranked = sorted(
+        groups,
+        key=lambda group_id: hashlib.sha256(f"{seed}:{group_id}".encode()).hexdigest(),
+    )
+    target = max(1, round(sum(len(ids) for ids in groups.values()) * dev_fraction))
+    dev_ids = set()
+    for group_id in ranked:
+        if len(dev_ids) >= target:
+            break
+        dev_ids.update(groups[group_id])
+    all_ids = {image_id for ids in groups.values() for image_id in ids}
+    return all_ids - dev_ids, dev_ids
+
+
+def token_f1(ground_truth, prediction) -> float:
+    gt = clean_text(ground_truth)
+    pred = clean_text(prediction)
+    if not gt and not pred:
+        return 1.0
+    gt_tokens = set(gt.lower().split())
+    pred_tokens = set(pred.lower().split())
+    if not gt_tokens or not pred_tokens:
+        return 0.0
+    common = len(gt_tokens & pred_tokens)
+    return 2 * common / (len(gt_tokens) + len(pred_tokens))
+
+
+def character_error_rate(ground_truth, prediction) -> float:
+    gt = clean_text(ground_truth)
+    pred = clean_text(prediction)
+    if not gt:
+        return 0.0 if not pred else 1.0
+    distance = list(range(len(pred) + 1))
+    for row, gt_char in enumerate(gt, 1):
+        previous, distance[0] = distance[0], row
+        for column, pred_char in enumerate(pred, 1):
+            old = distance[column]
+            distance[column] = (
+                previous
+                if gt_char == pred_char
+                else 1 + min(previous, distance[column], distance[column - 1])
+            )
+            previous = old
+    return min(distance[-1] / len(gt), 1.0)
+
+
+def composite_metrics(rows: Iterable[Mapping]) -> dict:
+    rows = list(rows)
+    if not rows:
+        return {"rows": 0, "product_f1": 0.0, "ocr_cer": 0.0, "composite": 0.0}
+    product = sum(
+        token_f1(row.get("product_name_gt"), row.get("product_name_pred"))
+        for row in rows
+    ) / len(rows)
+    cer = sum(
+        character_error_rate(row.get("ocr_text_gt"), row.get("ocr_text_pred"))
+        for row in rows
+    ) / len(rows)
+    return {
+        "rows": len(rows),
+        "product_f1": product,
+        "ocr_cer": cer,
+        "composite": 0.6 * product + 0.4 * (1.0 - cer),
+    }
+
+
+# Compatibility name used by the product head and evaluation cells.
+extract_product = predict_product_rule
+
+rule_tests = [
+    ("Nestle NAN OPTI pro PLUS digestion", "Nestlé NAN OPTIPRO PLUS"),
+    ("PATE CỘT ĐÈN HẢI PHÒNG", "Pate Cột Đèn Hải Phòng"),
+    ("CP vị hôi hôi bở bở", "CP"),
+    ("No product in this text", ""),
+]
+for text, expected in rule_tests:
+    got = extract_product(text)
+    assert got == expected, (text, got, expected)
+print(f"Scored product rules loaded: {len(_PRODUCT_RULES)}")
+
+
+# %% [markdown]
+# ## Cell 3b — Train Lightweight Product Head
+# 
+# Trains in **seconds on CPU**. Serialized size typically **2–5 MB**.
+# 
+# | Component | Size | Inference |
+# |---|---|---|
+# | `BRAND_RULES` | 0 MB | ~0.01 ms |
+# | Sklearn head (this cell) | ~few MB | ~0.5 ms |
+# | EasyOCR (Cell 4) | ~200 MB | ~1–2 s/img |
+# 
+# **Pattern:** rules first → binary "has product?" gate → TF-IDF char n-grams + LogisticRegression.
+
+# %% [code]
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+
+def find_manifest():
+    candidates = [
+        INPUT_DIR / "artifacts" / "label_manifest.csv",
+        INPUT_DIR / "label_manifest.csv",
+        Path("artifacts/label_manifest.csv"),
+    ]
+    if Path("/kaggle/input").exists():
+        candidates.extend(sorted(Path("/kaggle/input").rglob("label_manifest.csv")))
+    return next((path for path in candidates if path.exists()), None)
+
+
+def normalize_product_label(value, alias_map=None) -> str:
+    label = canonicalize_product(value, alias_map)
+    return predict_product_rule(label, min_score=55) or label
+
+
+def print_train_product_constraints(train_labels):
+    if train_labels is None:
+        return
+    df = train_labels.copy()
+    df["ocr_text"] = df["ocr_text"].astype(str).map(clean_text)
+    df["product_name"] = df["product_name"].astype(str).map(clean_text)
+    nonempty = df[df["product_name"] != ""]
+    print("\nTrain product constraints:")
+    print(f"  rows={len(df):,} | product_fill={(len(nonempty) / max(len(df), 1)):.1%} | ocr_empty={(df['ocr_text'] == '').mean():.1%}")
+    print(f"  unique_raw={nonempty['product_name'].nunique():,} | singleton_raw={(nonempty['product_name'].value_counts() == 1).sum():,}")
+    folded = nonempty["product_name"].map(ascii_fold).str.lower()
+    priority_patterns = [
+        ("Đồ Hộp Hạ Long", r"\bdo\s*hop\s*ha\s*long\b"),
+        ("Nestlé/NAN", r"\bnestle\b|\bnan\b"),
+        ("Pate Cột Đèn", r"\bpate\b.*\bcot\b.*\bden\b|\bcot\b.*\bden\b.*\bpate\b"),
+        ("Ha Long Canfoco", r"\bha\s*long\s*canfoco\b|\bhalong\s*canfoco\b|\bcanfoco\b"),
+        ("Highlands Coffee", r"\bhighlands?\s*coffee\b|\bhighlands?\b"),
+        ("Aptamil", r"\baptamil\b"),
+    ]
+    for name, pattern in priority_patterns:
+        count = folded.str.contains(pattern, regex=True).sum()
+        print(f"  {name:<18}: {count:>4} labels")
+    print("  priority: specific product family > high-support brand > generic fallback")
+
+
+class ProductPredictor:
+    def __init__(self, min_class_count=3, prob_threshold=0.55, max_features=3000):
+        self.min_class_count = min_class_count
+        self.prob_threshold = prob_threshold
+        self.max_features = max_features
+        self._has_clf = self._prod_clf = None
+
+    def fit(self, train_labels, rule_fn):
+        df = train_labels.copy()
+        df["ocr_text"] = df["ocr_text"].astype(str).map(clean_text)
+        self._alias_map = build_product_alias_map(df["product_name"])
+        df["product_name"] = df["product_name"].map(
+            lambda value: normalize_product_label(value, self._alias_map)
+        )
+        self._rule_fn = rule_fn
+        self._has_clf = Pipeline([
+            ("tfidf", TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4),
+                                      max_features=self.max_features, min_df=2)),
+            ("clf", LogisticRegression(max_iter=400, class_weight="balanced")),
+        ])
+        self._has_clf.fit(df["ocr_text"], (df["product_name"] != "").astype(int))
+        pos = df[(df["ocr_text"] != "") & (df["product_name"] != "")]
+        keep = pos["product_name"].value_counts()
+        pos = pos[pos["product_name"].isin(keep[keep >= self.min_class_count].index)]
+        self._prod_clf = Pipeline([
+            ("tfidf", TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4),
+                                      max_features=self.max_features, min_df=2)),
+            ("clf", LogisticRegression(max_iter=400, class_weight="balanced")),
+        ])
+        if len(pos):
+            self._prod_clf.fit(pos["ocr_text"], pos["product_name"])
+        self._n_train = len(df)
+        self._n_classes = pos["product_name"].nunique() if len(pos) else 0
+        return self
+
+    def predict(self, ocr_text):
+        ocr_text = clean_text(ocr_text)
+        if not ocr_text:
+            return ""
+        ruled = self._rule_fn(ocr_text)
+        if ruled:
+            return ruled
+        if self._has_clf is None or self._prod_clf is None:
+            return ""
+        classes = list(self._has_clf.classes_)
+        proba = self._has_clf.predict_proba([ocr_text])[0]
+        if 1 not in classes or proba[classes.index(1)] < self.prob_threshold:
+            return ""
+        return normalize_product_label(str(self._prod_clf.predict([ocr_text])[0]), self._alias_map)
+
+
+product_predictor = None
+product_train_df = train_labels_df
+manifest_path = find_manifest()
+if train_labels_df is not None and manifest_path is not None:
+    manifest = pd.read_csv(manifest_path, keep_default_na=False)
+    train_ids = set(manifest.loc[manifest["split"] == "train", "image_id"])
+    product_train_df = train_labels_df[train_labels_df["image_id"].isin(train_ids)].copy()
+    print(f"Using trusted grouped train split: {len(product_train_df):,} rows")
+elif train_labels_df is not None:
+    print("Warning: label_manifest.csv not found; training on all labels.")
+
+if product_train_df is not None:
+    print_train_product_constraints(product_train_df)
+    product_predictor = ProductPredictor(
+        min_class_count=3,
+        prob_threshold=0.55,
+        max_features=3000,
+    ).fit(product_train_df, extract_product)
+    print(
+        f"Product head: {product_predictor._n_train:,} rows, "
+        f"{product_predictor._n_classes:,} canonical classes"
+    )
+    if manifest_path is not None:
+        dev_ids = set(manifest.loc[manifest["split"] == "dev", "image_id"])
+        product_dev_df = train_labels_df[train_labels_df["image_id"].isin(dev_ids)]
+        threshold_scores = []
+        for threshold in [0.35, 0.45, 0.55, 0.60, 0.70]:
+            product_predictor.prob_threshold = threshold
+            predictions = product_dev_df["ocr_text"].map(product_predictor.predict)
+            score = sum(
+                token_f1(gt, pred)
+                for gt, pred in zip(product_dev_df["product_name"], predictions)
+            ) / max(len(product_dev_df), 1)
+            threshold_scores.append((score, threshold))
+        best_score, best_threshold = max(threshold_scores)
+        product_predictor.prob_threshold = best_threshold
+        print(
+            f"Grouped-dev product threshold={best_threshold:.2f}, "
+            f"token F1={best_score:.4f}"
+        )
+
+
+def predict_product(ocr_text: str) -> str:
+    if product_predictor is not None:
+        return product_predictor.predict(ocr_text)
+    return extract_product(ocr_text)
+
+
+# %% [markdown]
+# ## Cell 4 — OCR Engine (Demo Backend)
+# 
+# EasyOCR is **not lightweight** (~200 MB) — included so the notebook runs end-to-end on Kaggle without API keys.
+# 
+# **For deployment:** replace `run_ocr()` internals with a smaller OCR and keep `predict_product()` unchanged.
+
+# %% [code]
+import easyocr
+import json
+import numpy as np
+
+reader = easyocr.Reader(["vi", "en"], gpu=False, verbose=False)
+OCR_CONFIG = {
+    "primary_threshold": 0.25,
+    "retry_threshold": 0.20,
+    "min_long_side": 720,
+    "max_long_side": 1280,
+    "retry_min_chars": 6,
+    "retry_min_confidence": 0.32,
+}
+CONFIG_HASH = hashlib.sha256(
+    json.dumps(OCR_CONFIG, sort_keys=True).encode()
+).hexdigest()[:12]
+RAW_OCR_JSONL = WORK_DIR / "raw_ocr_detections.jsonl"
+print(f"EasyOCR loaded; config={CONFIG_HASH}")
+
+
+def load_image(image_id: str):
+    path = IMAGES_DIR / f"{image_id}.jpg"
+    if not path.exists():
+        return None
+    try:
+        return Image.open(path).convert("RGB")
+    except Exception:
+        return None
+
+
+def prepare_image(img, retry=False):
+    size = resize_dimensions(
+        *img.size,
+        min_long_side=OCR_CONFIG["min_long_side"],
+        max_long_side=OCR_CONFIG["max_long_side"],
+    )
+    if img.size != size:
+        img = img.resize(size, Image.LANCZOS)
+    if retry:
+        img = ImageEnhance.Contrast(img).enhance(1.35)
+        img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+
+def run_ocr_pass(img, pass_name, threshold):
+    raw = reader.readtext(np.array(img), detail=1, paragraph=False)
+    selected = select_detections(raw, confidence_threshold=threshold)
+    summary = detection_summary(selected)
+    return {
+        "pass_name": pass_name,
+        "text": detections_to_text(selected),
+        "detection_count": summary["detection_count"],
+        "mean_confidence": summary["mean_confidence"],
+        "raw_detections": [normalize_detection(item) for item in raw],
+    }
+
+
+def run_ocr(image_id: str) -> dict:
+    started = time.perf_counter()
+    img = load_image(image_id)
+    if img is None:
+        return {
+            "image_id": image_id, "ocr_text": "", "product_name": "",
+            "runtime_seconds": time.perf_counter() - started,
+            "ocr_pass": "missing_image", "detection_count": 0,
+            "mean_confidence": 0.0, "error": "missing_or_invalid_image",
+            "raw_passes": [],
+        }
+    try:
+        primary = run_ocr_pass(
+            prepare_image(img, retry=False),
+            "primary",
+            OCR_CONFIG["primary_threshold"],
+        )
+        retry = None
+        if should_retry_ocr(
+            primary["text"],
+            primary["detection_count"],
+            primary["mean_confidence"],
+            min_chars=OCR_CONFIG["retry_min_chars"],
+            min_mean_confidence=OCR_CONFIG["retry_min_confidence"],
+        ):
+            retry = run_ocr_pass(
+                prepare_image(img, retry=True),
+                "retry",
+                OCR_CONFIG["retry_threshold"],
+            )
+        chosen = choose_ocr_pass(primary, retry)
+        text = postprocess_ocr(chosen["text"])
+        return {
+            "image_id": image_id,
+            "ocr_text": text,
+            "product_name": predict_product(text),
+            "runtime_seconds": time.perf_counter() - started,
+            "ocr_pass": chosen["pass_name"],
+            "detection_count": chosen["detection_count"],
+            "mean_confidence": chosen["mean_confidence"],
+            "error": "",
+            "raw_passes": [item for item in (primary, retry) if item is not None],
+        }
+    except Exception as exc:
+        return {
+            "image_id": image_id, "ocr_text": "", "product_name": "",
+            "runtime_seconds": time.perf_counter() - started,
+            "ocr_pass": "error", "detection_count": 0,
+            "mean_confidence": 0.0, "error": repr(exc), "raw_passes": [],
+        }
+
+
+print("\nSmoke test on first image...")
+smoke = run_ocr(test_df["image_id"].iloc[0])
+print({key: value for key, value in smoke.items() if key != "raw_passes"})
+
+
+# %% [markdown]
+# ## Cell 5 — Main Loop
+# 
+# Processes test images on **CPU**. Most time is OCR (~1–2 s/image); product head adds <1 ms.
+# 
+# Expected composite score: **~0.5** (reference starter — improve accuracy while keeping models small for Final Presentation).
+
+# %% [code]
+SAVE_EVERY = 50
+CHECKPOINT_COLUMNS = [
+    "image_id", "ocr_text", "product_name", "runtime_seconds", "ocr_pass",
+    "detection_count", "mean_confidence", "error", "config_hash",
+]
+done_ids = set()
+results = []
+
+if CHECKPOINT_CSV.exists():
+    ckpt = pd.read_csv(CHECKPOINT_CSV, keep_default_na=False)
+    hashes = set(ckpt.get("config_hash", pd.Series(dtype=str)).astype(str))
+    if hashes == {CONFIG_HASH}:
+        done_ids = set(ckpt["image_id"])
+        results = ckpt.to_dict("records")
+        print(f"Resuming matching checkpoint: {len(done_ids):,} images")
+    else:
+        print("Ignoring checkpoint from a different OCR configuration")
+
+pending = [image_id for image_id in test_df["image_id"] if image_id not in done_ids]
+print(f"Pending: {len(pending):,} | Done: {len(done_ids):,}")
+
+raw_mode = "a" if done_ids and RAW_OCR_JSONL.exists() else "w"
+with RAW_OCR_JSONL.open(raw_mode, encoding="utf-8") as raw_handle:
+    for idx, image_id in enumerate(tqdm(pending, desc="OCR Progress")):
+        result = run_ocr(image_id)
+        raw_handle.write(json.dumps({
+            "image_id": image_id,
+            "config_hash": CONFIG_HASH,
+            "passes": result.pop("raw_passes"),
+        }, ensure_ascii=False) + "\n")
+        result["config_hash"] = CONFIG_HASH
+        results.append(result)
+        if (idx + 1) % SAVE_EVERY == 0:
+            pd.DataFrame(results, columns=CHECKPOINT_COLUMNS).to_csv(
+                CHECKPOINT_CSV, index=False, encoding="utf-8"
+            )
+            raw_handle.flush()
+
+pd.DataFrame(results, columns=CHECKPOINT_COLUMNS).to_csv(
+    CHECKPOINT_CSV, index=False, encoding="utf-8"
+)
+df_result = pd.DataFrame(results)
+print(f"Processed     : {len(df_result):,}")
+print(f"OCR fill rate : {(df_result['ocr_text'].str.strip() != '').mean():.1%}")
+print(f"Product fill  : {(df_result['product_name'].str.strip() != '').mean():.1%}")
+print(f"Retry selected: {(df_result['ocr_pass'] == 'retry').mean():.1%}")
+print(f"Errors        : {(df_result['error'].str.strip() != '').sum():,}")
+
+
+# %% [markdown]
+# ## Cell 6 — Validate and Export submission.csv
+# 
+# Validate submission format before uploading to Kaggle. All checks must pass.
+
+# %% [code]
+import csv
+import sys
+
+sys.path.insert(0, str(Path(".").resolve()))
+try:
+    from build_dataset import write_submission_csv
+except ImportError:
+    def write_submission_csv(df, path):
+        out = df[["image_id", "ocr_text", "product_name"]].copy()
+        for col in ("ocr_text", "product_name"):
+            out[col] = out[col].fillna("").astype(str).str.strip()
+            out.loc[out[col] == "", col] = " "
+        out.to_csv(path, index=False, encoding="utf-8", quoting=csv.QUOTE_ALL)
+
+sub = pd.DataFrame(results)[["image_id", "ocr_text", "product_name"]]
+sample = pd.read_csv(SAMPLE_CSV, keep_default_na=False)
+
+print("Validating submission format...\n")
+checks = {}
+
+expected_ids = set(sample["image_id"])
+got_ids = set(sub["image_id"])
+checks["AC-1 Row count match"] = len(sub) == len(sample)
+checks["AC-2 No extra IDs"] = len(got_ids - expected_ids) == 0
+checks["AC-3 No missing IDs"] = len(expected_ids - got_ids) == 0
+checks["AC-4 No duplicate IDs"] = not sub["image_id"].duplicated().any()
+checks["AC-5 No null values"] = not sub.isnull().any().any()
+checks["AC-6 No newline in text"] = not sub["ocr_text"].str.contains(r"\n|\t", regex=True, na=False).any()
+checks["AC-7 Columns correct"] = list(sub.columns) == ["image_id", "ocr_text", "product_name"]
+
+all_pass = True
+for name, ok in checks.items():
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{status}] {name}")
+    if not ok:
+        all_pass = False
+
+print()
+if all_pass:
+    sub = sub.set_index("image_id").reindex(sample["image_id"]).reset_index()
+    sub["ocr_text"] = sub["ocr_text"].fillna("").astype(str).str.strip()
+    sub["product_name"] = sub["product_name"].fillna("").astype(str).str.strip()
+    write_submission_csv(sub, OUTPUT_CSV)
+
+    print("All checks passed.")
+    print(f"Saved to: {OUTPUT_CSV}")
+    print("\nFirst 5 rows:")
+    display(sub.head())
+    ocr_fill = (sub["ocr_text"].str.strip() != "").mean()
+    prod_fill = (sub["product_name"].str.strip() != "").mean()
+    print(f"\nStats: OCR fill={ocr_fill:.1%} | Product fill={prod_fill:.1%} | Rows={len(sub):,}")
+    print("\nNext steps:")
+    print("  1. Kaggle -> Competition -> Submit Predictions")
+    print("  2. Upload submission.csv from /kaggle/working/")
+    print("  3. Check score on the Public Leaderboard")
+else:
+    print("Validation failed — fix issues above before submitting.")
+
+
+# %% [markdown]
+# ## Cell 7 — Local Evaluation (Composite Score)
+# 
+# Score predictions with a **standalone inline** metric (same formula as Kaggle).
+# 
+# **Local dev:** uses `smce_dataset/solution.csv` (BTC only — never upload to participants).  
+# **Compare:** rules-only vs train-enhanced product model on the same OCR output.
+
+# %% [code]
+import json
+
+
+def _inline_composite_score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
+    """Fallback metric identical to the competition formula."""
+
+    def _clean(val) -> str:
+        return "" if pd.isna(val) else str(val).strip()
+
+    required_cols = {"ocr_text", "product_name"}
+    if row_id_column_name not in solution.columns or row_id_column_name not in submission.columns:
+        raise ValueError(f"Missing id column: {row_id_column_name}")
+    if not required_cols.issubset(solution.columns) or not required_cols.issubset(submission.columns):
+        raise ValueError("Both solution and submission must contain ocr_text and product_name")
+
+    sub_ids = submission[row_id_column_name]
+    sol_ids = solution[row_id_column_name]
+    if sub_ids.duplicated().any():
+        raise ValueError("Duplicate image_id in submission")
+    if set(sub_ids) != set(sol_ids):
+        missing = len(set(sol_ids) - set(sub_ids))
+        extra = len(set(sub_ids) - set(sol_ids))
+        raise ValueError(f"Submission IDs must match solution exactly (missing {missing}, extra {extra})")
+
+    merged = solution.merge(submission, on=row_id_column_name, suffixes=("_gt", "_pred"), how="inner")
+    if merged.empty:
+        raise ValueError("No matching rows after merge")
+
+    def token_f1(gt, pred) -> float:
+        gt = _clean(gt)
+        pred = _clean(pred)
+        if not gt and not pred:
+            return 1.0
+        gt_tokens = set(gt.lower().split())
+        pred_tokens = set(pred.lower().split())
+        if not gt_tokens or not pred_tokens:
+            return 0.0
+        common = gt_tokens & pred_tokens
+        precision = len(common) / len(pred_tokens)
+        recall = len(common) / len(gt_tokens)
+        if precision + recall == 0:
+            return 0.0
+        return 2 * precision * recall / (precision + recall)
+
+    def cer(gt, pred) -> float:
+        gt = _clean(gt)
+        pred = _clean(pred)
+        if len(gt) == 0:
+            return 0.0 if len(pred) == 0 else 1.0
+        m, n = len(gt), len(pred)
+        dp = list(range(n + 1))
+        for i in range(1, m + 1):
+            prev, dp[0] = dp[0], i
+            for j in range(1, n + 1):
+                temp = dp[j]
+                dp[j] = prev if gt[i - 1] == pred[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
+                prev = temp
+        return min(dp[n] / len(gt), 1.0)
+
+    product_f1 = merged.apply(lambda r: token_f1(r["product_name_gt"], r["product_name_pred"]), axis=1).mean()
+    avg_cer = merged.apply(lambda r: cer(r["ocr_text_gt"], r["ocr_text_pred"]), axis=1).mean()
+    return round(float(0.6 * product_f1 + 0.4 * (1.0 - avg_cer)), 4)
+
+
+# Standalone metric: do not load any external notebook/python file.
+score_fn = _inline_composite_score
+print("Using standalone inline composite score")
+
+solution_paths = [
+    Path("smce_dataset/solution.csv"),
+    Path("/kaggle/input/smce-solution/solution.csv"),
+]
+solution_df = None
+for p in solution_paths:
+    if p.exists():
+        solution_df = pd.read_csv(p, keep_default_na=False)
+        print(f"Loaded solution: {p} ({len(solution_df):,} rows)")
+        break
+
+if solution_df is None:
+    print("solution.csv not found — skip local scoring (OK on Kaggle participant side)")
+elif not results:
+    print("No OCR predictions yet — running oracle ablation on GT ocr_text (product head only)\n")
+    gt = solution_df[["image_id", "ocr_text", "product_name"]]
+    for c in ["ocr_text", "product_name"]:
+        gt[c] = gt[c].astype(str).str.strip()
+    sub_rules = gt.copy()
+    sub_rules["product_name"] = sub_rules["ocr_text"].map(extract_product)
+    sub_train = gt.copy()
+    sub_train["product_name"] = sub_train["ocr_text"].map(predict_product)
+    print(f"  Rules-only product:     {score_fn(gt, sub_rules, 'image_id'):.4f}")
+    print(f"  Train-enhanced product: {score_fn(gt, sub_train, 'image_id'):.4f}")
+    print("\nRun Cell 5 for full pipeline score (OCR + product model)")
+else:
+    pred_df = pd.DataFrame(results)[["image_id", "ocr_text", "product_name"]]
+    pred_rules = pred_df.copy()
+    pred_rules["product_name"] = pred_rules["ocr_text"].map(extract_product)
+
+    gt = solution_df[["image_id", "ocr_text", "product_name"]]
+    s_full = score_fn(gt, pred_df, "image_id")
+    s_rules = score_fn(gt, pred_rules, "image_id")
+
+    print("\nComposite score (full pipeline — OCR + train product model):")
+    print(f"  Score: {s_full:.4f}")
+
+    print("\nAblation (same OCR, rules-only product):")
+    print(f"  Score: {s_rules:.4f}")
+
+    if solution_df is not None and "Usage" in solution_df.columns:
+        for split in ["Public", "Private"]:
+            ids = set(solution_df.loc[solution_df["Usage"] == split, "image_id"])
+            if not ids:
+                continue
+            gt_s = gt[gt["image_id"].isin(ids)]
+            pred_s = pred_df[pred_df["image_id"].isin(ids)]
+            print(f"  {split}: {score_fn(gt_s, pred_s, 'image_id'):.4f}")
+
+    sample_empty = pd.read_csv(SAMPLE_CSV, keep_default_na=False)
+    sample_empty["ocr_text"] = ""
+    sample_empty["product_name"] = ""
+    print(f"\nReference — empty sample_submission: {score_fn(gt, sample_empty, 'image_id'):.4f}")
+
+# %% [markdown]
+# ## Cell 8 — Next Steps (Beat ~0.5, Stay Lightweight)
+# 
+# This notebook targets **~0.5** as a **reference**, not SOTA. Round 3 judges **CPU efficiency, model size, inference speed**.
+# 
+# | Priority | Idea | Lightweight? |
+# |---|---|---|
+# | 1 | Swap EasyOCR → PaddleOCR mobile / Tesseract | Yes |
+# | 2 | Expand `BRAND_RULES` | Yes (0 MB) |
+# | 3 | Tune `max_features` / `prob_threshold` in Cell 3b | Yes (few MB) |
+# | 4 | Quantized or distilled vision model | Medium |
+# 
+# **Avoid for Final Presentation:** large vision LLMs, GPU-only pipelines, multi-GB checkpoints.
+# 
+# SMCE Challenge 2026 | RAISE Lab, HCMUT
+# 
