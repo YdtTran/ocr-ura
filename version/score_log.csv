@@ -1,3 +1,0 @@
-version,date,kaggle_score,local_score,main_change,verdict,next_action
-v001_baseline,2026-06-07,0.5264,"0.5284 on 500-image training sample","Reference baseline","Useful baseline","Canonicalize labels, add grouped validation, cache raw OCR"
-v002_improved_ocr,2026-06-08,TBD,TBD,"Grouped label artifacts, OCR retry/cache, product canonicalization/rules","Awaiting score","Record Kaggle score, inspect noisy product false positives"
